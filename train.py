@@ -36,7 +36,8 @@ class GATModel(torch.nn.Module):
         super(GATModel, self).__init__()
         self.conv1 = GATConv(input_dim, hidden_dim)
         self.conv2 = GATConv(hidden_dim, hidden_dim)
-        self.fc = torch.nn.Linear(hidden_dim, seq_out_len * output_dim)
+        self.fc_mu = torch.nn.Linear(hidden_dim, seq_out_len * output_dim)  # 均值预测
+        self.fc_sigma = torch.nn.Linear(hidden_dim, seq_out_len * output_dim)  # 标准差预测
         self.seq_out_len = seq_out_len
         self.output_dim = output_dim
         self.batch_size = batch_size
@@ -47,12 +48,15 @@ class GATModel(torch.nn.Module):
         x = F.relu(self.conv2(x, edge_index))
         x = global_mean_pool(x, batch)  # 全局池化
 
-        x = self.fc(x)
+        mu = self.fc_mu(x)
+        sigma = F.softplus(self.fc_sigma(x))  # 使用softplus确保标准差为正
 
         # 重塑输出以符合多步预测的需求
-        x = x.view(-1, self.seq_out_len, self.output_dim)
+        mu = mu.view(-1, self.seq_out_len, self.output_dim)
+        sigma = sigma.view(-1, self.seq_out_len, self.output_dim)
 
-        return x
+        return mu, sigma
+
 
 
 
@@ -75,12 +79,16 @@ def build_small_graphs(x, y, look_back):
 
 def split_sequence_graph(sequence, seq_in_len, seq_out_len):
     X, Y = [], []
+    # 确保在迭代中留有足够的行来完成seq_out_len的抽取
     for i in range(len(sequence) - seq_in_len - seq_out_len + 1):
         seq_x = sequence.iloc[i:i + seq_in_len].values
+        # 此处改动: 抽取从seq_in_len开始的seq_out_len行数据作为每个seq_y
         seq_y = sequence.iloc[i + seq_in_len:i + seq_in_len + seq_out_len].values
         X.append(seq_x)
-        Y.append(seq_y)
+        Y.append(seq_y)  # 这里seq_y应该自然地是[seq_out_len, 特征数]的形状
     return np.array(X), np.array(Y)
+
+
 
 def mean_absolute_percentage_error(y_true, y_pred):
     y_true, y_pred = np.array(y_true), np.array(y_pred)
@@ -95,6 +103,28 @@ def custom_collate(batch):
     index_tensor = torch.tensor(index_list, dtype=torch.long)
 
     return batched_graph, index_tensor
+
+
+def calculate_interval_metrics(actuals, predictions, sigmas, coverage_factor=1.96):
+    lower_bounds = predictions - coverage_factor * sigmas
+    upper_bounds = predictions + coverage_factor * sigmas
+
+    # 计算PICP
+    in_interval = (actuals >= lower_bounds) & (actuals <= upper_bounds)
+    PICP = np.mean(in_interval)
+
+    # 计算ACIW
+    ACIW = np.mean(upper_bounds - lower_bounds)
+
+    # 计算PINAW
+    data_range = actuals.max() - actuals.min()
+    PINAW = ACIW / data_range if data_range != 0 else 0
+
+    # 计算CWC
+    CWC = PINAW * (1.0 - PICP) if PICP < 0.95 else PINAW * (1.0 - PICP + 0.1 * (PICP - 0.95))
+
+    return PICP, ACIW, PINAW, CWC
+
 
 plt.rcParams['font.sans-serif'] = ['SimHei']  # 显示中文
 plt.rcParams['axes.unicode_minus'] = False  # 显示负号
@@ -113,6 +143,7 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
 for seq_out_len in seq_out_lens:
+    print(f"Training for seq_out_len = {seq_out_len}")
     # 应用 split_sequence_graph 函数并创建小图
     x, y = split_sequence_graph(data, seq_in_len, seq_out_len)
     train_x, test_x, train_y, test_y = train_test_split(x, y, test_size=0.2, random_state=42)
@@ -124,7 +155,6 @@ for seq_out_len in seq_out_lens:
     # 使用 DataLoader 加载小图
     train_loader = DataLoader(train_graphs, batch_size=batch_size, shuffle=True)
     test_loader = DataLoader(test_graphs, batch_size=batch_size, shuffle=False)
-    print("Length of DataLoader:", len(train_loader))
     # 用 x 的形状来初始化模型
     model = GATModel(input_dim=x.shape[-1], hidden_dim=hidden_dim, output_dim=output_dim, seq_out_len=seq_out_len,batch_size=batch_size)
     criterion = nn.MSELoss()
@@ -133,13 +163,15 @@ for seq_out_len in seq_out_lens:
     model.to(device)
 
     # 初始化指标存储列表
-    mse_scores, rmse_scores, mae_scores, r2_scores, mape_scores = [], [], [], [], []
+    picp_scores, aciw_scores, pinaw_scores, cwc_scores = [], [], [], []
 
     # 运行模型 10 次
     num_runs = 10
     for run in range(num_runs):
         predictions = []
+        sigmas = []
         actuals = []
+
         # 训练循环
         for epoch in range(epochs):
             model.train()
@@ -148,70 +180,55 @@ for seq_out_len in seq_out_lens:
             for batch_idx, batch_data in progress_bar:
                 optimizer.zero_grad()
                 batch_graphs = batch_data.to(device)
-                outputs = model(batch_graphs)
+                mu, sigma = model(batch_graphs)
+
                 targets = batch_data.y.to(device)
-                targets = targets.view_as(outputs)
-                loss = criterion(outputs, targets)
+                targets = targets.view(mu.shape)  # 重塑目标以匹配输出形状
+                loss = criterion(mu, targets)  # 可以根据需要修改损失函数
                 loss.backward()
                 optimizer.step()
-
                 train_loss += loss.item()
                 progress_bar.set_postfix({"Train Loss": f"{train_loss / (batch_idx + 1):.4f}"})
 
         # 测试循环
         model.eval()
-        test_loss = 0.0
-        progress_bar = tqdm(enumerate(test_loader), total=len(test_loader), desc="Testing")
+        total_batches = len(test_loader)
+        processed_batches = 0
+
         with torch.no_grad():
-            for batch_idx, batch_data in progress_bar:
+            for batch_idx, batch_data in enumerate(test_loader):
                 batch_graphs = batch_data.to(device)
-                outputs = model(batch_graphs)
+                mu, sigma = model(batch_graphs)
                 targets = batch_data.y.to(device)
-                targets = targets.view_as(outputs)  # 重塑目标以匹配输出形状
-                loss = criterion(outputs, targets)
-
-                test_loss += loss.item()
-                progress_bar.set_postfix({"Test Loss": f"{test_loss / (batch_idx + 1):.4f}"})
-                # 收集预测值和实际值，保持其三维结构
-                predictions.extend(outputs.cpu().numpy())
+                predictions.extend(mu.cpu().numpy())
+                sigmas.extend(sigma.cpu().numpy())
                 actuals.extend(targets.cpu().numpy())
+                processed_batches += 1
 
-        # 将预测和实际值转换为 NumPy 数组并重塑为二维
-        predictions = np.array(predictions).reshape(-1, output_dim)
-        actuals = np.array(actuals).reshape(-1, output_dim)
-
-        # 确保预测值和实际值的尺寸一致
-        assert predictions.shape == actuals.shape, "Inconsistent shapes between predictions and actuals"
         # 计算评估指标
-        mse = mean_squared_error(actuals, predictions)
-        rmse = np.sqrt(mse)
-        mae = mean_absolute_error(actuals, predictions)
-        r2 = r2_score(actuals, predictions)
-        mape = mean_absolute_percentage_error(actuals, predictions)
+        PICP, ACIW, PINAW, CWC = calculate_interval_metrics(np.array(actuals), np.array(predictions),
+                                                                    np.array(sigmas))
 
         # 存储指标
-        mse_scores.append(mse)
-        rmse_scores.append(rmse)
-        mae_scores.append(mae)
-        r2_scores.append(r2)
-        mape_scores.append(mape)
+        picp_scores.append(PICP)
+        aciw_scores.append(ACIW)
+        pinaw_scores.append(PINAW)
+        cwc_scores.append(CWC)
 
         # 打印当前迭代的评估指标
-        print(f'Run {run + 1}: MSE: {mse}, RMSE: {rmse}, MAE: {mae}, R-squared: {r2}, MAPE: {mape}')
+        print(f'Run {run + 1}: PICP: {PICP}, ACIW: {ACIW}, PINAW: {PINAW}, CWC: {CWC}')
         print('-' * 50)
 
     # 计算平均评估指标
-    avg_mse = np.mean(mse_scores)
-    avg_rmse = np.mean(rmse_scores)
-    avg_mae = np.mean(mae_scores)
-    avg_r2 = np.mean(r2_scores)
-    avg_mape = np.mean(mape_scores)
+    avg_picp = np.mean(picp_scores)
+    avg_aciw = np.mean(aciw_scores)
+    avg_pinaw = np.mean(pinaw_scores)
+    avg_cwc = np.mean(cwc_scores)
 
     # 打印平均评估指标
     print('Average Metrics Over Runs')
-    print('Average MSE:', avg_mse)
-    print('Average RMSE:', avg_rmse)
-    print('Average MAE:', avg_mae)
-    print('Average R-squared:', avg_r2)
-    print('Average MAPE:', avg_mape)
+    print('Average PICP:', avg_picp)
+    print('Average ACIW:', avg_aciw)
+    print('Average PINAW:', avg_pinaw)
+    print('Average CWC:', avg_cwc)
     print('-' * 100)
